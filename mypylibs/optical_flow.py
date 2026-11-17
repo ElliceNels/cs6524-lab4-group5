@@ -45,16 +45,26 @@ def _dominant_motion(flow):
     return agree[np.argmax(agree.sum(axis=1))]
 
 
-def _measure(frame_idx, points, flow):
-    # Uncovered background and occluder edges produce flow unlike the object's own
-    keep = _dominant_motion(flow)
-    points, flow = points[keep], flow[keep]
+def _summarise(frame_idx, points, flow):
     keep = _inliers(points)
     if keep.sum() < MIN_MOVING_POINTS:
         return None
     points, flow = points[keep], flow[keep]
     return Measurement(frame_idx, points.mean(axis=0), flow.mean(axis=0),
                        points.std(axis=0), flow.std(axis=0), len(points))
+
+
+def _measure(frame_idx, points, flow):
+    """Split moving points into groups of coherent motion, largest first."""
+    # Separate movers (object, hands, occluder edges) each get their own measurement
+    measurements = []
+    while len(points) >= MIN_MOVING_POINTS:
+        group = _dominant_motion(flow)
+        measurement = _summarise(frame_idx, points[group], flow[group])
+        if measurement is not None:
+            measurements.append(measurement)
+        points, flow = points[~group], flow[~group]
+    return measurements
 
 
 def _track(prev_gray, gray, points):
@@ -86,7 +96,7 @@ def _direction_colour(flow):
     return tuple(int(c) for c in cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0])
 
 
-def _draw(frame, trails, moving, flow, measurement):
+def _draw(frame, trails, moving, flow, measurements):
     overlay = frame.copy()
     for trail, is_moving, f in zip(trails, moving, flow):
         if not is_moving:
@@ -97,7 +107,10 @@ def _draw(frame, trails, moving, flow, measurement):
         cv2.circle(overlay, tuple(map(int, trail[-1])), 3, colour, -1, cv2.LINE_AA)
     cv2.addWeighted(overlay, 0.8, frame, 0.2, 0, frame)
 
-    if measurement is not None:
+    for other in measurements[1:]:
+        cv2.drawMarker(frame, tuple(map(int, other.position)), (200, 200, 200), cv2.MARKER_CROSS, 12, 1)
+    if measurements:
+        measurement = measurements[0]
         centre = measurement.position
         radius = np.maximum(measurement.position_std, 1).astype(int)
         cv2.ellipse(frame, tuple(map(int, centre)), tuple(map(int, radius)), 0, 0, 360,
@@ -109,7 +122,7 @@ def _draw(frame, trails, moving, flow, measurement):
         cv2.drawMarker(frame, tuple(map(int, centre)), (0, 0, 255), cv2.MARKER_CROSS, 16, 2)
         text = (f'pos ({centre[0]:.0f}, {centre[1]:.0f}) px  '
                 f'vel ({measurement.velocity[0]:+.1f}, {measurement.velocity[1]:+.1f}) px/frame  '
-                f'n={measurement.n_points}')
+                f'n={measurement.n_points}  groups={len(measurements)}')
     else:
         text = 'no measurement'
     (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
@@ -118,22 +131,23 @@ def _draw(frame, trails, moving, flow, measurement):
 
 
 def _write_csv(path, measurements, n_frames):
-    by_frame = {m.frame: m for m in measurements}
+    by_frame = {}
+    for m in measurements:
+        by_frame.setdefault(m.frame, []).append(m)
     with open(path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['frame', 'x', 'y', 'vx', 'vy', 'sx', 'sy', 'svx', 'svy', 'n'])
+        writer.writerow(['frame', 'group', 'x', 'y', 'vx', 'vy', 'sx', 'sy', 'svx', 'svy', 'n'])
         for i in range(n_frames):
-            m = by_frame.get(i)
-            if m is None:
-                writer.writerow([i] + [''] * 9)
-            else:
-                writer.writerow([i, *np.round(m.position, 2), *np.round(m.velocity, 3),
+            if i not in by_frame:
+                writer.writerow([i] + [''] * 10)
+            for group, m in enumerate(by_frame.get(i, [])):
+                writer.writerow([i, group, *np.round(m.position, 2), *np.round(m.velocity, 3),
                                  *np.round(m.position_std, 2), *np.round(m.velocity_std, 3),
                                  m.n_points])
 
 
 def compute_optical_flow(video_path, output_dir):
-    """Track LK keypoints, write `XX_of.mp4` and `XX_of.csv`, return per-frame measurements."""
+    """Track LK keypoints, write `XX_of.mp4` and `XX_of.csv`, return every motion group of every frame."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise FileNotFoundError(video_path)
@@ -171,13 +185,12 @@ def compute_optical_flow(video_path, output_dir):
             trails = [(t + [p])[-TRAIL_LENGTH:]
                       for t, p, g in zip(trails, nxt.reshape(-1, 2), good) if g]
 
-        measurement = None
+        frame_measurements = []
         if moving.sum() >= MIN_MOVING_POINTS:
-            measurement = _measure(frame_idx, points.reshape(-1, 2)[moving], flow[moving])
-        if measurement is not None:
-            measurements.append(measurement)
+            frame_measurements = _measure(frame_idx, points.reshape(-1, 2)[moving], flow[moving])
+        measurements += frame_measurements
 
-        _draw(frame, trails, moving, flow, measurement)
+        _draw(frame, trails, moving, flow, frame_measurements)
         writer.write(frame)
 
         # Moving regions are seeded every frame: smooth objects rarely win the global corner budget
